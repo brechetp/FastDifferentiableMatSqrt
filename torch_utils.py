@@ -10,30 +10,31 @@ def f(x):
     return sqrt(one-x)
 
 # Derive the taylor and pade' coefficients for MTP, MPA
-a = taylor(f, 0, 10)
-pade_p, pade_q = pade(a, 5, 5)
+N =15
+a = taylor(f, 0, 2*N)
+pade_p, pade_q = pade(a, N, N)
 a = torch.from_numpy(np.array(a).astype(float))
 pade_p = torch.from_numpy(np.array(pade_p).astype(float))
 pade_q = torch.from_numpy(np.array(pade_q).astype(float))
 
-def matrix_taylor_polynomial(p, I):
+def matrix_taylor_polynomial(p, I, batch=True):
     p_sqrt= I
     p_app = I - p
     p_hat = p_app
-    for i in range(10):
+    for i in range(2*N):
       p_sqrt += a[i+1]*p_hat
-      p_hat = p_hat.bmm(p_app)
+      p_hat = p_hat.bmm(p_app) if batch else p_hat.mm(p_app)
     return p_sqrt
 
-def matrix_pade_approximant(p,I):
+def matrix_pade_approximant(p,I, batch=True):
     p_sqrt = pade_p[0]*I
     q_sqrt = pade_q[0]*I
     p_app = I - p
     p_hat = p_app
-    for i in range(5):
+    for i in range(N):
         p_sqrt += pade_p[i+1]*p_hat
         q_sqrt += pade_q[i+1]*p_hat
-        p_hat = p_hat.bmm(p_app)
+        p_hat = p_hat.bmm(p_app) if batch else p_hat.mm(p_app)
     #There are 4 options to compute the MPA: comput Matrix Inverse or Matrix Linear System on CPU/GPU;
     #It seems that single matrix is faster on CPU and batched matrices are faster on GPU
     #Please check which one is faster before running the code;
@@ -42,15 +43,15 @@ def matrix_pade_approximant(p,I):
     #return torch.linalg.inv(q_sqrt).mm(p_sqrt)
     #return torch.linalg.inv(q_sqrt.cpu()).cuda().bmm(p_sqrt)
 
-def matrix_pade_approximant_inverse(p,I):
+def matrix_pade_approximant_inverse(p,I, batch=True):
     p_sqrt = pade_p[0]*I
     q_sqrt = pade_q[0]*I
     p_app = I - p
     p_hat = p_app
-    for i in range(5):
+    for i in range(N):
         p_sqrt += pade_p[i+1]*p_hat
         q_sqrt += pade_q[i+1]*p_hat
-        p_hat = p_hat.bmm(p_app)
+        p_hat = p_hat.bmm(p_app) if batch else p_hat.mm(p_app)
     #There are 4 options to compute the MPA_inverse: comput Matrix Inverse or Matrix Linear System on CPU/GPU;
     #It seems that single matrix is faster on CPU and batched matrices are faster on GPU
     #Please check which one is faster before running the code;
@@ -77,10 +78,10 @@ class MPA_Lya(torch.autograd.Function):
         M, M_sqrt, normM,  I = ctx.saved_tensors
         b = M_sqrt / torch.sqrt(normM)
         c = grad_output / torch.sqrt(normM)
-        for i in range(8):
+        for i in range(18):
             #In case you might terminate the iteration by checking convergence
-            #if th.norm(b-I)<1e-4:
-            #    break
+            if torch.norm(b-I)<1e-6:
+               break
             b_2 = b.bmm(b)
             c = 0.5 * (c.bmm(3.0*I-b_2)-b_2.bmm(c)+b.bmm(c).bmm(b))
             b = 0.5 * b.bmm(3.0 * I - b_2)
@@ -107,13 +108,74 @@ class MPA_Lya_Inv(torch.autograd.Function):
         norm_sqrt_inv = torch.norm(M_sqrt_inv)
         b = M_sqrt_inv / norm_sqrt_inv
         c = grad_lya / norm_sqrt_inv
-        for i in range(8):
+        for i in range(18):
             #In case you might terminate the iteration by checking convergence
-            #if th.norm(b-I)<1e-4:
-            #    break
+            if torch.norm(b-I)<1e-6:
+               break
             b_2 = b.bmm(b)
             c = 0.5 * (c.bmm(3.0 * I - b_2) - b_2.bmm(c) + b.bmm(c).bmm(b))
             b = 0.5 * b.bmm(3.0 * I - b_2)
+        grad_input = 0.5 * c
+        return grad_input
+
+"""
+Versions for 2D input only
+"""
+class MPA_Lya_2D(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, M):
+        unsqueezed=False
+        normM = torch.norm(M)#,dim=[0,1]).reshape(M.size(0),1,1)
+        I = torch.eye(M.size(0), requires_grad=False, device=M.device)
+        #This is for MTP calculation
+        #M_sqrt = matrix_taylor_polynomial(M/normM,I)
+        M_sqrt = matrix_pade_approximant(M / normM, I, batch=False)
+        M_sqrt = M_sqrt * torch.sqrt(normM)
+        ctx.save_for_backward(M, M_sqrt, normM,  I)
+        return M_sqrt
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        M, M_sqrt, normM,  I = ctx.saved_tensors
+        b = M_sqrt / torch.sqrt(normM)
+        c = grad_output / torch.sqrt(normM)
+        for i in range(18):
+            #In case you might terminate the iteration by checking convergence
+            if torch.norm(b-I)<1e-6:
+               break
+            b_2 = b.mm(b)
+            c = 0.5 * (c.mm(3.0*I-b_2)-b_2.mm(c)+b.mm(c).mm(b))
+            b = 0.5 * b.mm(3.0 * I - b_2)
+        grad_input = 0.5 * c
+        return grad_input
+
+#Differentiable Inverse Square Root by MPA_Lya_Inv
+class MPA_Lya_Inv_2D(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, M):
+        normM = torch.norm(M,)
+        I = torch.eye(M.size(0), requires_grad=False, device=M.device)
+        #M_sqrt = matrix_taylor_polynomial(M/normM,I)
+        M_sqrt_inv = matrix_pade_approximant_inverse(M / normM, I, batch=False)
+        M_sqrt_inv = M_sqrt_inv / torch.sqrt(normM)
+        ctx.save_for_backward(M, M_sqrt_inv,  I)
+        return M_sqrt_inv
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        M, M_sqrt_inv,  I = ctx.saved_tensors
+        M_inv = M_sqrt_inv.mm(M_sqrt_inv)
+        grad_lya = - M_inv.mm(grad_output).mm(M_inv)
+        norm_sqrt_inv = torch.norm(M_sqrt_inv)
+        b = M_sqrt_inv / norm_sqrt_inv
+        c = grad_lya / norm_sqrt_inv
+        for i in range(18):
+            #In case you might terminate the iteration by checking convergence
+            if torch.norm(b-I)<1e-6:
+               break
+            b_2 = b.mm(b)
+            c = 0.5 * (c.mm(3.0 * I - b_2) - b_2.mm(c) + b.mm(c).mm(b))
+            b = 0.5 * b.mm(3.0 * I - b_2)
         grad_input = 0.5 * c
         return grad_input
 
